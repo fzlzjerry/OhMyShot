@@ -31,8 +31,8 @@ public struct TextAnalysis: Sendable {
 }
 
 extension VisionPipeline {
-    /// Reads the text with L1, finds codes alongside it, then reads tables with the document request.
-    /// The document request waits for L1, so no more than two accurate requests ever overlap. It runs
+    /// Reads the text with L1, then finds codes alongside the document request for tables.
+    /// The document request waits for L1 and uses the same process-wide recognition slot. It runs
     /// on every image: a table whose columns sit close reads as one line per row, so the lines alone
     /// cannot rule a table out, and skipping it saved only about 80 ms and 15 MB.
     ///
@@ -42,10 +42,19 @@ extension VisionPipeline {
     /// cells take their text from the pieces' lines all the same.
     @concurrent
     public func analyze(_ image: CGImage) async throws -> TextAnalysis {
-        async let codes = detectCodes(in: image)
+        let started = ContinuousClock.now
         let result = try await recognize(image)
-        let tables = ((try? await documentTables(in: image)) ?? []).map { $0.filled(from: result.lines) }
-        return TextAnalysis(result: result, tables: tables, codes: (try? await codes) ?? [])
+        let remaining = options.overallTimeout - (ContinuousClock.now - started)
+        try Task.checkCancellation()
+        guard remaining > .zero else { return TextAnalysis(result: result, tables: [], codes: []) }
+        // Once the text is read, optional table/code detection cannot keep it hidden indefinitely.
+        let extra = try? await withTimeout(remaining) {
+            async let codes = detectCodes(in: image)
+            let tables = ((try? await documentTables(in: image)) ?? []).map { $0.filled(from: result.lines) }
+            return TextAnalysis(result: result, tables: tables, codes: (try? await codes) ?? [])
+        }
+        try Task.checkCancellation()
+        return extra ?? TextAnalysis(result: result, tables: [], codes: [])
     }
 
     private func detectCodes(in image: CGImage) async throws -> [OCRCode] {
@@ -69,8 +78,8 @@ extension VisionPipeline {
         request.barcodeDetectionOptions.enabled = false
         let configured = request
         let timeout = options.timeout
-        let observations = try await RecognitionSlots.shared.run {
-            try await withTimeout(timeout) { try await configured.perform(on: image) }
+        let observations = try await withTimeout(timeout) {
+            try await RecognitionSlots.shared.run { try await configured.perform(on: image) }
         }
         let size = CGSize(width: image.width, height: image.height)
         return observations.first?.document.tables.map { table in

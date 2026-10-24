@@ -23,6 +23,7 @@ final class TextCaptureCoordinator {
     private let pipeline: VisionPipeline = {
         var options = VisionPipeline.Options.preferred()
         options.timeout = .seconds(30)
+        options.overallTimeout = .seconds(30)
         return VisionPipeline(options: options)
     }()
     /// Shared by the panel and Translate Area: a language pair's first translation loads its model.
@@ -30,6 +31,8 @@ final class TextCaptureCoordinator {
     private let highlight = TextSelectionHighlight()
     private let lens = TranslationLens()
     private let hud = TextResultHUD()
+    private var warmup: Task<Void, Never>?
+    private var captureReading: Task<Void, Never>?
     private var panel: TextRecognitionWindowController?
     /// The last recognition, so the card can switch between kept and joined line breaks.
     private var last: Recognition?
@@ -100,9 +103,13 @@ final class TextCaptureCoordinator {
     /// keeps the reading on this Mac, for the URL API and Shortcuts.
     func captureText(joinLines: Bool, allowsCloud: Bool = true, done: ((String?) -> Void)? = nil) {
         guard !overlay.isActive else { done?(nil); return }
+        captureReading?.cancel()
+        waitingForCloud?.cancel()
+        highlight.hide()
         // The model loads while the person selects, which hides its first-use cost.
         let pipeline = pipeline
-        Task {
+        warmup?.cancel()
+        warmup = Task {
             let probe = LatencyProbe("ocr.prewarm")
             await pipeline.prewarm()
             probe.end()
@@ -112,6 +119,8 @@ final class TextCaptureCoordinator {
             // The highlight appears in the same turn the overlay closes, so no frame goes by without
             // the selection.
             guard let self else { done?(nil); return }
+            warmup?.cancel()
+            warmup = nil
             switch outcome {
             case .region(let rect, _, let modifiers, let frozen) where modifiers.contains(.option):
                 done?(nil)
@@ -121,10 +130,10 @@ final class TextCaptureCoordinator {
                 Task { await self.openPanel(window: target) }
             case .region(let rect, _, _, let frozen):
                 highlight.show(rect)
-                Task { await self.recognize(region: rect, frozen: frozen, joinLines: joinLines, allowsCloud: allowsCloud, done: done) }
+                captureReading = Task { await self.recognize(region: rect, frozen: frozen, joinLines: joinLines, allowsCloud: allowsCloud, done: done) }
             case .window(let target, _):
                 highlight.show(target.frame)
-                Task { await self.recognize(window: target, joinLines: joinLines, allowsCloud: allowsCloud, done: done) }
+                captureReading = Task { await self.recognize(window: target, joinLines: joinLines, allowsCloud: allowsCloud, done: done) }
             case .annotated, .color, .record, .scroll, .allInOne, .cancelled:
                 done?(nil)
             }
@@ -143,14 +152,17 @@ final class TextCaptureCoordinator {
         region rect: CGRect, frozen: CapturedFrame? = nil, joinLines: Bool, copiesToClipboard: Bool = true, allowsCloud: Bool = false,
         done: ((String?) -> Void)? = nil
     ) async {
+        guard !Task.isCancelled else { done?(nil); return }
         highlight.show(rect)
         do {
             let frame = try await capture(rect, frozen: frozen)
+            try Task.checkCancellation()
             await recognize(
                 frame.image, selection: rect, place: Self.place(of: frame), joinLines: joinLines, copiesToClipboard: copiesToClipboard,
                 allowsCloud: allowsCloud, done: done
             )
         } catch {
+            guard !Task.isCancelled else { done?(nil); return }
             Log.capture.error("Capture Text failed to capture: \(error.localizedDescription, privacy: .public)")
             highlight.finish(copied: nil, announces: !settings.showTextResult)
             done?(nil)
@@ -158,14 +170,17 @@ final class TextCaptureCoordinator {
     }
 
     private func recognize(window target: WindowTarget, joinLines: Bool, allowsCloud: Bool, done: ((String?) -> Void)? = nil) async {
+        guard !Task.isCancelled else { done?(nil); return }
         highlight.show(target.frame)
         do {
             let frame = try await capturer.captureWindow(target, shadow: false, layout: displays.layout)
+            try Task.checkCancellation()
             await recognize(
                 frame.image, selection: target.frame, place: Self.place(of: frame, window: target), joinLines: joinLines, copiesToClipboard: true,
                 allowsCloud: allowsCloud, done: done
             )
         } catch {
+            guard !Task.isCancelled else { done?(nil); return }
             Log.capture.error("Capture Text failed to capture the window: \(error.localizedDescription, privacy: .public)")
             highlight.finish(copied: nil, announces: !settings.showTextResult)
             done?(nil)
@@ -238,6 +253,7 @@ final class TextCaptureCoordinator {
         _ image: CGImage, selection: CGRect, place: AppTextPlace? = nil, joinLines: Bool, copiesToClipboard: Bool, allowsCloud: Bool = false,
         done: ((String?) -> Void)? = nil
     ) async {
+        guard !Task.isCancelled else { done?(nil); return }
         let showsCard = settings.showTextResult
         let probe = LatencyProbe("ocr.recognize")
         readings += 1
@@ -254,12 +270,22 @@ final class TextCaptureCoordinator {
         let formulas = reader.map { reader in
             Task { await Self.elements(in: image, formulas: reader.formulas, vlm: vlm, seconds: Self.tableWait, helper: reader.helper) }
         }
+        defer {
+            cloudReading?.cancel()
+            formulas?.cancel()
+        }
         let visionLines: [OCRLine]?
         do {
             visionLines = try await pipeline.recognize(image).lines
         } catch {
             Log.capture.error("Capture Text failed to recognize: \(String(describing: error), privacy: .public)")
             visionLines = nil
+        }
+        guard !Task.isCancelled, reading == readings else {
+            cloudReading?.cancel()
+            formulas?.cancel()
+            done?(nil)
+            return
         }
         // Asked at once, while the screen still shows what the picture does: before any wait for the cloud model.
         let appText = Self.appText(for: visionLines, in: settings.readsAppText ? place : nil, layout: displays.layout)
@@ -268,7 +294,7 @@ final class TextCaptureCoordinator {
         if let cloud, let cloudReading {
             let started = ContinuousClock.now
             let outcome = await Self.first(cloudReading, within: Self.cloudWait)
-            guard reading == readings else {
+            guard !Task.isCancelled, reading == readings else {
                 // Another Capture Text started meanwhile: the clipboard and the highlight are its.
                 formulas?.cancel()
                 Log.capture.notice("Capture Text let go of a reading another one replaced")
@@ -335,6 +361,8 @@ final class TextCaptureCoordinator {
             }
         }
         probe.end()
+
+        guard !Task.isCancelled, reading == readings else { done?(nil); return }
 
         // The card says where the text came from only when it shows anyway.
         var recognition = Recognition(lines: lines, selection: selection, joined: joinLines, copiesToClipboard: copiesToClipboard, note: note ?? (showsCard ? appNote : nil))
@@ -599,7 +627,8 @@ final class TextCaptureCoordinator {
         #endif
         do {
             let read = try await TextReaderTool.elements(
-                ofPictureAt: file, formulas: formulas, vlm: vlm, seconds: seconds, pressure: pressure, helper: helper, found: counted
+                ofPictureAt: file, formulas: formulas, vlm: vlm, seconds: seconds, pressure: pressure, helper: helper, found: counted,
+                timeout: .milliseconds(Int64(seconds * 1000))
             )
             if read.tablesLeft > 0 {
                 Log.capture.notice("Left \(read.tablesLeft, privacy: .public) tables and charts as Vision read them: the system is short of memory for the VLM pack")
@@ -648,9 +677,12 @@ final class TextCaptureCoordinator {
         guard !overlay.isActive else { return }
         lens.close(animated: false)
         let pipeline = pipeline
-        Task { await pipeline.prewarm() }
+        warmup?.cancel()
+        warmup = Task { await pipeline.prewarm() }
         overlay.freezesScreen = settings.freezeScreen
         overlay.begin(mode: .area, purpose: .text) { [weak self] outcome in
+            self?.warmup?.cancel()
+            self?.warmup = nil
             switch outcome {
             case .region(let rect, _, let modifiers, let frozen):
                 self?.highlight.show(rect)

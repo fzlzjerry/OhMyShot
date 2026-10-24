@@ -50,10 +50,8 @@ public final class TextRecognition: Sendable {
         request.usesLanguageCorrection = false
         request.recognitionLanguages = model.languages
         let configured = request
-        return try await RecognitionSlots.shared.run {
-            // Not started for a reading no longer wanted (one that waited for a slot).
-            try Task.checkCancellation()
-            return try await withTimeout(timeout) { try await configured.perform(on: image) }
+        return try await withTimeout(timeout) {
+            try await RecognitionSlots.shared.run { try await configured.perform(on: image) }
         }
     }
 }

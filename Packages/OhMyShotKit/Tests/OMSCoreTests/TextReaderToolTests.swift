@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import Synchronization
 import Testing
@@ -145,5 +146,145 @@ struct TextReaderToolTests {
                 ofPictureAt: URL(filePath: "/tmp/p.png"), joinsWrappedLines: true, helper: URL(filePath: "/nonexistent/reader"), resources: ActiveResources()
             )
         }
+    }
+
+    private func eventually(_ condition: () -> Bool) async throws {
+        for _ in 0..<200 where !condition() { try await Task.sleep(for: .milliseconds(10)) }
+        try #require(condition())
+    }
+
+    @Test func aDeadlineStopsNativeWorkThatIgnoresTermination() async throws {
+        let reader = try helper("""
+        trap '' TERM
+        read line
+        printf '%s' "$$" > "$0.pid"
+        while :; do :; done
+        """)
+        let resources = ActiveResources()
+        // Process startup on a busy Mac can itself take a few hundred milliseconds. Leave enough
+        // time to exercise the scripted hang, rather than timing out before the script reaches it.
+        let started = ContinuousClock.now
+        await #expect(throws: TextReaderTool.Failure.timedOut) {
+            try await TextReaderTool.text(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), joinsWrappedLines: true, helper: reader, resources: resources,
+                timeout: .seconds(2)
+            )
+        }
+        #expect(ContinuousClock.now - started < .seconds(4))
+        let pid = try #require(Int32(String(contentsOfFile: reader.path + ".pid", encoding: .utf8)))
+        try await eventually { resources.isIdle && kill(pid, 0) != 0 }
+    }
+
+    @Test func cancellingAHungReaderReturnsAndKillsIt() async throws {
+        let reader = try helper("""
+        trap '' TERM
+        read line
+        printf '%s' "$$" > "$0.pid"
+        while :; do :; done
+        """)
+        let resources = ActiveResources()
+        let reading = Task {
+            try await TextReaderTool.text(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), joinsWrappedLines: true, helper: reader, resources: resources
+            )
+        }
+        defer { reading.cancel() }
+        try await eventually { FileManager.default.fileExists(atPath: reader.path + ".pid") }
+        let pid = try #require(Int32(String(contentsOfFile: reader.path + ".pid", encoding: .utf8)))
+        let started = ContinuousClock.now
+        reading.cancel()
+        await #expect(throws: CancellationError.self) { try await reading.value }
+        #expect(ContinuousClock.now - started < .seconds(1))
+        try await eventually { resources.isIdle && kill(pid, 0) != 0 }
+    }
+
+    @Test func closingOutputWithoutExitingStillHasADeadline() async throws {
+        let reader = try helper("""
+        trap '' TERM
+        read line
+        exec 1>&-
+        while :; do :; done
+        """)
+        let resources = ActiveResources()
+        await #expect(throws: TextReaderTool.Failure.timedOut) {
+            try await TextReaderTool.lines(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), pack: URL(filePath: "/packs/l2"), helper: reader,
+                resources: resources, timeout: .seconds(2)
+            )
+        }
+        try await eventually { resources.isIdle }
+    }
+
+    @Test func progressDoesNotResetTheWholeRunDeadline() async throws {
+        let reader = try helper(answering + """
+
+        trap '' TERM
+        printf '{"id":"%s","found":2,"foundTables":1}\\n' "$id"
+        while :; do :; done
+        """)
+        let resources = ActiveResources()
+        let found = FoundCounts()
+        await #expect(throws: TextReaderTool.Failure.timedOut) {
+            try await TextReaderTool.elements(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), formulas: URL(filePath: "/packs/formula"), helper: reader,
+                found: { value in found.all.withLock { $0.append(value) } }, resources: resources, timeout: .seconds(2)
+            )
+        }
+        #expect(found.all.withLock { $0 } == [.init(formulas: 1, tables: 1)])
+        try await eventually { resources.isIdle }
+    }
+
+    @Test func anExitedReadersDescendantCannotKeepTheCallerWaitingOnOutput() async throws {
+        let reader = try helper("""
+        read line
+        /bin/sleep 10 &
+        printf '%s' "$!" > "$0.child"
+        exit 0
+        """)
+        defer {
+            if let text = try? String(contentsOfFile: reader.path + ".child", encoding: .utf8), let pid = Int32(text) {
+                _ = kill(pid, SIGKILL)
+            }
+        }
+        let resources = ActiveResources()
+        // Process startup on a busy Mac can itself take a few hundred milliseconds. Leave enough
+        // time to exercise the scripted hang, rather than timing out before the script reaches it.
+        let started = ContinuousClock.now
+        await #expect(throws: TextReaderTool.Failure.timedOut) {
+            try await TextReaderTool.text(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), joinsWrappedLines: true, helper: reader, resources: resources,
+                timeout: .seconds(2)
+            )
+        }
+        #expect(ContinuousClock.now - started < .seconds(4))
+        try await eventually { resources.isIdle }
+    }
+
+    @Test func cancellingContinuousProgressStopsCallbacksAndCleansUp() async throws {
+        let reader = try helper(answering + """
+
+        trap '' TERM
+        while :; do
+            printf '{"id":"%s","found":1,"foundTables":0}\\n' "$id"
+        done
+        """)
+        let resources = ActiveResources()
+        let updates = Mutex(0)
+        let reading = Task {
+            try await TextReaderTool.elements(
+                ofPictureAt: URL(filePath: "/tmp/p.png"), formulas: URL(filePath: "/packs/formula"), helper: reader,
+                found: { _ in updates.withLock { $0 += 1 } }, resources: resources
+            )
+        }
+        defer { reading.cancel() }
+        try await eventually { updates.withLock { $0 > 0 } }
+        let started = ContinuousClock.now
+        reading.cancel()
+        await #expect(throws: CancellationError.self) { try await reading.value }
+        #expect(ContinuousClock.now - started < .seconds(1))
+        let stoppedAt = updates.withLock { $0 }
+        try await eventually { resources.isIdle }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(updates.withLock { $0 } == stoppedAt)
     }
 }

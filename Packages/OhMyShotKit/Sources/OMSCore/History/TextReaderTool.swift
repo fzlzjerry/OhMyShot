@@ -1,6 +1,8 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import OSLog
+import Synchronization
 
 /// A PP-OCR model pack the text reader reads with beside Vision (L2 beside L1, Docs/ocr.md › L2 beside L1).
 public struct TextReaderPack: Sendable, Equatable {
@@ -21,7 +23,9 @@ public struct TextReaderPack: Sendable, Equatable {
 ///
 /// Vision keeps what a recognition used for as long as its process lives (Docs/perf.md, M2 and M5 — power gate:
 /// the action read in the app left it 56 MB larger for good); read in the text reader, the app stays as it was.
-/// The run holds an `ActiveResources` lease while it lasts, and cancelling the task that awaits it ends it.
+/// The run holds an `ActiveResources` lease while its process lasts. Every operation has a complete-run
+/// `timeout` (120 seconds by default to allow first-use compilation); cancellation or the deadline stops
+/// waiting immediately and ends the helper, forcibly if native work ignores termination.
 public enum TextReaderTool {
     public enum Failure: Error, Equatable {
         /// The reader didn't start.
@@ -30,6 +34,8 @@ public enum TextReaderTool {
         case unreadable(String)
         /// The reader ended without answering.
         case noAnswer(status: Int32)
+        /// The complete run, including model loading and process exit, exceeded its deadline.
+        case timedOut
     }
 
     /// A line a model pack read, in the picture's pixels with a top-left origin.
@@ -58,13 +64,13 @@ public enum TextReaderTool {
     @concurrent
     public static func text(
         ofPictureAt url: URL, joinsWrappedLines: Bool, pack: URL? = nil, formulas: URL? = nil, vlm: URL? = nil, seconds: Double? = nil,
-        helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared
+        helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)
     ) async throws -> String {
         let job = Job(
             id: UUID().uuidString, path: url.path(percentEncoded: false), joinsWrappedLines: joinsWrappedLines, pack: pack?.path(percentEncoded: false),
             formulas: formulas?.path(percentEncoded: false), vlm: vlm?.path(percentEncoded: false), seconds: seconds
         )
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let text = answer.text { return text }
         throw Failure.unreadable(answer.error ?? "")
     }
@@ -107,10 +113,10 @@ public enum TextReaderTool {
     @concurrent
     public static func formulas(
         ofPictureAt url: URL, pack: URL, helper: URL, found: (@Sendable (Int) -> Void)? = nil, priority: QualityOfService = .userInitiated,
-        resources: ActiveResources = .shared
+        resources: ActiveResources = .shared, timeout: Duration = .seconds(120)
     ) async throws -> [FoundFormula] {
         let counted: (@Sendable (Found) -> Void)? = found.map { found in { @Sendable counts in found(counts.formulas) } }
-        return try await elements(ofPictureAt: url, formulas: pack, helper: helper, found: counted, priority: priority, resources: resources).formulas
+        return try await elements(ofPictureAt: url, formulas: pack, helper: helper, found: counted, priority: priority, resources: resources, timeout: timeout).formulas
     }
 
     /// How many formulas, and how many tables and charts, the reader found to read.
@@ -132,13 +138,13 @@ public enum TextReaderTool {
     @concurrent
     public static func elements(
         ofPictureAt url: URL, formulas: URL? = nil, vlm: URL? = nil, seconds: Double? = nil, pressure: MemoryPressure? = nil, helper: URL,
-        found: (@Sendable (Found) -> Void)? = nil, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared
+        found: (@Sendable (Found) -> Void)? = nil, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)
     ) async throws -> (formulas: [FoundFormula], tables: [FoundTable], tablesLeft: Int) {
         let job = Job(
             id: UUID().uuidString, path: url.path(percentEncoded: false), formulas: formulas?.path(percentEncoded: false),
             vlm: vlm?.path(percentEncoded: false), seconds: seconds, pressure: pressure?.name
         )
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources) { progress in
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout) { progress in
             if let count = progress.found { found?(Found(formulas: count - (progress.foundTables ?? 0), tables: progress.foundTables ?? 0)) }
         }
         if let formulas = answer.formulas { return (formulas, answer.tables ?? [], answer.tablesLeft ?? 0) }
@@ -148,10 +154,10 @@ public enum TextReaderTool {
     /// The lines the pack in `pack` reads in the picture at `url`, alone, for the app to put beside its own reading.
     @concurrent
     public static func lines(
-        ofPictureAt url: URL, pack: URL, helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared
+        ofPictureAt url: URL, pack: URL, helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)
     ) async throws -> [Line] {
         let job = Job(id: UUID().uuidString, path: url.path(percentEncoded: false), pack: pack.path(percentEncoded: false), lines: true)
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let lines = answer.lines { return lines }
         throw Failure.unreadable(answer.error ?? "")
     }
@@ -159,9 +165,9 @@ public enum TextReaderTool {
     /// Loads the pack in `pack` once, reading nothing: its first load compiles its models for the Neural Engine, which
     /// takes seconds, and later loads, in any run, find that done (Docs/ocr.md › The L2 pack).
     @concurrent
-    public static func warm(pack: URL, helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared) async throws {
+    public static func warm(pack: URL, helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)) async throws {
         let job = Job(id: UUID().uuidString, pack: pack.path(percentEncoded: false), warm: true)
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let error = answer.error { throw Failure.unreadable(error) }
     }
 
@@ -187,10 +193,10 @@ public enum TextReaderTool {
     /// The formula pack). Without the spaces at its ends that upstream's tidying leaves where it unwraps `\text{}`.
     @concurrent
     public static func formula(
-        ofPictureAt url: URL, pack: URL, helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared
+        ofPictureAt url: URL, pack: URL, helper: URL, priority: QualityOfService = .userInitiated, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)
     ) async throws -> Formula {
         let job = Job(id: UUID().uuidString, path: url.path(percentEncoded: false), formula: pack.path(percentEncoded: false))
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let latex = answer.latex, let ending = answer.ending {
             return Formula(latex: latex.trimmingCharacters(in: .whitespacesAndNewlines), ending: ending)
         }
@@ -199,9 +205,9 @@ public enum TextReaderTool {
 
     /// Compiles the formula pack's models once, reading nothing, so the first Capture Formula doesn't wait on it.
     @concurrent
-    public static func warm(formula pack: URL, helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared) async throws {
+    public static func warm(formula pack: URL, helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)) async throws {
         let job = Job(id: UUID().uuidString, warm: true, formula: pack.path(percentEncoded: false))
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let error = answer.error { throw Failure.unreadable(error) }
     }
 
@@ -210,9 +216,9 @@ public enum TextReaderTool {
     /// - Returns: how many entries were removed.
     @concurrent
     @discardableResult
-    public static func tidy(helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared) async throws -> Int {
+    public static func tidy(helper: URL, priority: QualityOfService = .utility, resources: ActiveResources = .shared, timeout: Duration = .seconds(120)) async throws -> Int {
         let job = Job(id: UUID().uuidString, tidy: true)
-        let answer = try await run(job, helper: helper, priority: priority, resources: resources)
+        let answer = try await run(job, helper: helper, priority: priority, resources: resources, timeout: timeout)
         if let removed = answer.removed { return removed }
         throw Failure.unreadable(answer.error ?? "")
     }
@@ -220,8 +226,12 @@ public enum TextReaderTool {
     /// Runs the reader on `job`. A line telling how far it got (`Answer.isProgress`) goes to `progress`; the answer is
     /// the last other line for the job.
     private static func run(
-        _ job: Job, helper: URL, priority: QualityOfService, resources: ActiveResources, progress: (@Sendable (Answer) -> Void)? = nil
+        _ job: Job, helper: URL, priority: QualityOfService, resources: ActiveResources, timeout: Duration,
+        progress: (@Sendable (Answer) -> Void)? = nil
     ) async throws -> Answer {
+        try Task.checkCancellation()
+        var jobLine = try JSONEncoder().encode(job)
+        jobLine.append(0x0A)
         let process = Process()
         process.executableURL = helper
         process.qualityOfService = priority
@@ -229,41 +239,122 @@ public enum TextReaderTool {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        let (exited, exiting) = AsyncStream.makeStream(of: Int32.self)
+        let (events, event) = AsyncStream.makeStream(of: RunEvent.self)
+        let lease = resources.acquire(.helperProcess)
         process.terminationHandler = { process in
-            exiting.yield(process.terminationStatus)
-            exiting.finish()
+            // Keep counting the actual helper, even after its caller stopped waiting.
+            lease.end()
+            event.yield(.exited(process.terminationStatus))
         }
         do {
             try process.run()
         } catch {
+            lease.end()
             throw Failure.unavailable(error.localizedDescription)
         }
-        let lease = resources.acquire(.helperProcess)
-        defer { lease.end() }
-
-        var line = try JSONEncoder().encode(job)
-        line.append(0x0A)
+        let reader = output.fileHandleForReading
+        let descriptor = reader.fileDescriptor
+        _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
+        let closed = Mutex(false)
+        reader.readabilityHandler = { handle in
+            // Cancellation can close the handle while a dispatched callback is still queued. Guard
+            // the descriptor and use a nonblocking read: neither a closed handle nor a stale readiness
+            // notification can trap in Foundation or delay the caller's cleanup.
+            let next = closed.withLock { closed -> RunEvent? in
+                guard !closed else { return nil }
+                var bytes = [UInt8](repeating: 0, count: 64 * 1024)
+                let count = Darwin.read(descriptor, &bytes, bytes.count)
+                if count > 0 { return .bytes(Data(bytes.prefix(count))) }
+                if count == 0 || (errno != EAGAIN && errno != EINTR) { return .eof }
+                return nil
+            }
+            if let next {
+                event.yield(next)
+                if case .eof = next { handle.readabilityHandler = nil }
+            }
+        }
+        // A hung native prediction may ignore SIGTERM. A separate, short grace period then ends this
+        // one-shot helper for good; its caller never waits for the helper or its stdout descendants.
+        func stop() {
+            guard process.isRunning else { return }
+            process.terminate()
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(250))
+                if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+            }
+        }
+        let timer = Task {
+            do {
+                try await Task.sleep(for: timeout)
+                event.yield(.timedOut)
+            } catch {}
+        }
+        defer {
+            timer.cancel()
+            reader.readabilityHandler = nil
+            closed.withLock { closed in
+                closed = true
+                try? reader.close()
+            }
+            event.finish()
+        }
         let writer = input.fileHandleForWriting
-        // A reader that stops early closes the pipe: writing then fails, rather than the signal ending the app.
+        // Job paths can exceed the pipe's capacity; writing must not hold up the deadline either.
         _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
-        try? writer.write(contentsOf: line)
-        try? writer.close()
+        let bytes = jobLine
+        Task.detached(priority: .utility) {
+            try? writer.write(contentsOf: bytes)
+            try? writer.close()
+        }
 
         return try await withTaskCancellationHandler {
+            var buffered = Data()
             var answer: Answer?
-            for try await line in output.fileHandleForReading.bytes.lines {
-                guard let decoded = try? JSONDecoder().decode(Answer.self, from: Data(line.utf8)), decoded.id == job.id else { continue }
+            var ended = false
+            var status: Int32?
+            func receive(_ data: Data) {
+                guard let decoded = try? JSONDecoder().decode(Answer.self, from: data), decoded.id == job.id else { return }
                 if decoded.isProgress { progress?(decoded) } else { answer = decoded }
             }
-            var status: Int32 = -1
-            for await code in exited { status = code }
-            try Task.checkCancellation()
-            guard let answer else { throw Failure.noAnswer(status: status) }
-            return answer
+            for await next in events {
+                switch next {
+                case .bytes(let bytes):
+                    buffered.append(bytes)
+                    while let newline = buffered.firstIndex(of: 0x0A) {
+                        receive(Data(buffered[..<newline]))
+                        buffered.removeSubrange(...newline)
+                    }
+                case .eof:
+                    if !buffered.isEmpty { receive(buffered); buffered.removeAll() }
+                    ended = true
+                case .exited(let code): status = code
+                case .timedOut:
+                    stop()
+                    throw Failure.timedOut
+                case .cancelled:
+                    stop()
+                    throw CancellationError()
+                }
+                if ended, let status {
+                    try Task.checkCancellation()
+                    guard let answer else { throw Failure.noAnswer(status: status) }
+                    return answer
+                }
+            }
+            // A cancelled iterator may end before its queued cancellation event is delivered.
+            stop()
+            throw CancellationError()
         } onCancel: {
-            process.terminate()
+            event.yield(.cancelled)
         }
+    }
+
+    private enum RunEvent: Sendable {
+        case bytes(Data)
+        case eof
+        case exited(Int32)
+        case timedOut
+        case cancelled
     }
 
     private struct Job: Encodable {

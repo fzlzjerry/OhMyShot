@@ -72,6 +72,7 @@ Each entry links its implementation commits or merged pull request and credits v
 
 ### Fixed
 
+- OCR warmups no longer queue ahead of repeated Capture Text requests. Recognition has a complete-run deadline, cancelled captures leave newer results alone, and stalled model-reader helpers terminate on cancellation or timeout. (by [@BenjaminD2023])
 - The native arrow appears over capture toolbar controls, and cursor visibility is restored correctly when returning to the canvas, cancelling, or entering another capture setup. ([#7]; by [@BenjaminD2023], [@fzlzjerry])
 - Shortcut recorders support Use Anyway for menu conflicts, including Command-Shift-S; assigning a shortcut to another OhMyShot action clears the previous assignment. ([#2]; by [@BenjaminD2023], [@fzlzjerry])
 - Measurement snapping better handles faint outlines and thin details, retaining the drawn rectangle when no credible boundary is found. ([#3]; by [@BenjaminD2023], [@fzlzjerry])
